@@ -12,6 +12,7 @@ import {IGitSourceSettings} from '../lib/git-source-settings'
 const testWorkspace = path.join(__dirname, '_temp', 'git-source-provider')
 const owner = 'owner'
 const name = 'repo'
+const submoduleName = 'sub'
 // A failed fetch is tried three times, 10 to 20 s apart.
 const gitTestTimeout = 120000
 
@@ -20,6 +21,7 @@ let serverUrl: string
 let projectRoot: string
 let authorPath: string
 let repositoryPath: string
+let originalRunnerTemp: string | undefined
 
 describe('git-source-provider tests', () => {
   beforeAll(async () => {
@@ -27,10 +29,21 @@ describe('git-source-provider tests', () => {
     projectRoot = path.join(testWorkspace, 'server')
     server = await startGitHttpServer(projectRoot)
     serverUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+
+    // The submodule fetch configures its auth in a global git config the
+    // checkout writes under RUNNER_TEMP.
+    originalRunnerTemp = process.env['RUNNER_TEMP']
+    process.env['RUNNER_TEMP'] = path.join(testWorkspace, 'runner-temp')
+    await io.mkdirP(process.env['RUNNER_TEMP'])
   })
 
   afterAll(async () => {
     await new Promise(resolve => server.close(resolve))
+    if (originalRunnerTemp === undefined) {
+      delete process.env['RUNNER_TEMP']
+    } else {
+      process.env['RUNNER_TEMP'] = originalRunnerTemp
+    }
   })
 
   beforeEach(() => {
@@ -115,6 +128,73 @@ describe('git-source-provider tests', () => {
     gitTestTimeout
   )
 
+  const submoduleStoreHoldsACorruptObject =
+    'recreates a kept repository whose submodule store holds a corrupt object read by the submodule update'
+  it(
+    submoduleStoreHoldsACorruptObject,
+    async () => {
+      await setup(submoduleStoreHoldsACorruptObject)
+      const submoduleAuthor = await serveRepository(submoduleName)
+      const subFirst = await commit(
+        {'s1.txt': 's1, first\n', 's2.txt': uniqueText('s2')},
+        {},
+        submoduleAuthor
+      )
+      const first = await commit(
+        {
+          '.gitmodules': `[submodule "sub"]\n\tpath = sub\n\turl = ../${submoduleName}\n`,
+          'dir-a/a.txt': 'a, first\n',
+          'dir-b/b.txt': uniqueText('b')
+        },
+        {sub: subFirst}
+      )
+      await gitSourceProvider.getSource(
+        withSubmodules(settingsFor(first, undefined))
+      )
+      const submodulePath = path.join(repositoryPath, 'sub')
+      expect(git(submodulePath, 'rev-parse', 'HEAD')).toBe(subFirst)
+
+      // A bit flips in the submodule's stored copy of s2.txt's blob.
+      const blob = git(submodulePath, 'rev-parse', `${subFirst}:s2.txt`)
+      corruptObject(path.join(repositoryPath, '.git', 'modules', 'sub'), blob)
+      expect(() => git(submodulePath, 'cat-file', '-p', blob)).toThrow(
+        /is corrupt|data stream error|unable to unpack/
+      )
+
+      // The next job checks out a commit pinning a new submodule commit that
+      // moves s2.txt to s3.txt: the submodule's checkout writes s3.txt from
+      // the stored copy.
+      await fs.promises.rename(
+        path.join(submoduleAuthor, 's2.txt'),
+        path.join(submoduleAuthor, 's3.txt')
+      )
+      const subSecond = await commit(
+        {'s1.txt': 's1, second\n'},
+        {},
+        submoduleAuthor
+      )
+      const second = await commit(
+        {'dir-a/a.txt': 'a, second\n'},
+        {sub: subSecond}
+      )
+      await gitSourceProvider.getSource(
+        withSubmodules(settingsFor(second, undefined))
+      )
+
+      await expectCheckedOut(second)
+      expect(git(submodulePath, 'rev-parse', 'HEAD')).toBe(subSecond)
+      expect(fs.readFileSync(path.join(submodulePath, 's3.txt'), 'utf8')).toBe(
+        execFileSync('git', ['show', `${subSecond}:s3.txt`], {
+          cwd: submoduleAuthor,
+          encoding: 'utf8'
+        })
+      )
+      expect(git(submodulePath, 'status', '--porcelain')).toBe('')
+      git(submodulePath, 'fsck', '--no-dangling')
+    },
+    gitTestTimeout
+  )
+
   const failsOnceInAFreshDirectory =
     'reports a failed checkout in a fresh directory without recreating it'
   it(
@@ -157,7 +237,7 @@ async function arrangeCorruptPack(testName: string): Promise<string> {
   expect(fs.existsSync(path.join(repositoryPath, 'dir-b', 'b.txt'))).toBe(false)
 
   const blob = git(repositoryPath, 'rev-parse', `${first}:dir-b/b.txt`)
-  corruptPackedObject(repositoryPath, blob)
+  corruptObject(path.join(repositoryPath, '.git'), blob)
   expect(() => git(repositoryPath, 'cat-file', '-p', blob)).toThrow(
     /is corrupt|data stream error/
   )
@@ -186,13 +266,17 @@ async function setup(testName: string): Promise<void> {
   testName = testName.replace(/[^a-zA-Z0-9_]+/g, '-')
   const root = path.join(testWorkspace, testName)
   repositoryPath = path.join(root, 'work')
-  authorPath = path.join(root, 'author')
   await io.mkdirP(repositoryPath)
-  await io.mkdirP(authorPath)
+  authorPath = await serveRepository(name)
+}
 
-  // The served repository is <projectRoot>/<owner>/<name>, the path the
-  // checkout's fetch URL names.
-  const served = path.join(projectRoot, owner, name)
+/**
+ * Serves an empty repository named `repositoryName` at
+ * <projectRoot>/<owner>/<repositoryName>, the path a fetch URL of the
+ * checkout names, and returns the path of a new repository that pushes to it.
+ */
+async function serveRepository(repositoryName: string): Promise<string> {
+  const served = path.join(projectRoot, owner, repositoryName)
   await io.rmRF(served)
   await io.mkdirP(served)
   git(served, 'init', '--bare', '-q', '-b', 'main')
@@ -200,23 +284,47 @@ async function setup(testName: string): Promise<void> {
   git(served, 'config', 'uploadpack.allowReachableSHA1InWant', 'true')
   git(served, 'config', 'http.receivepack', 'false')
 
-  git(authorPath, 'init', '-q', '-b', 'main')
-  git(authorPath, 'config', 'user.name', 'test')
-  git(authorPath, 'config', 'user.email', 'test@example.com')
-  git(authorPath, 'remote', 'add', 'origin', served)
+  const author = path.join(
+    path.dirname(repositoryPath),
+    `${repositoryName}-author`
+  )
+  await io.rmRF(author)
+  await io.mkdirP(author)
+  git(author, 'init', '-q', '-b', 'main')
+  git(author, 'config', 'user.name', 'test')
+  git(author, 'config', 'user.email', 'test@example.com')
+  git(author, 'remote', 'add', 'origin', served)
+  return author
 }
 
-/** Writes `files` in the author repository, commits and pushes to main. */
-async function commit(files: {[file: string]: string}): Promise<string> {
+/**
+ * Writes `files` in the author repository `author`, records each of
+ * `gitlinks` as a submodule at the commit it names, commits and pushes to
+ * main.
+ */
+async function commit(
+  files: {[file: string]: string},
+  gitlinks: {[file: string]: string} = {},
+  author: string = authorPath
+): Promise<string> {
   for (const [file, text] of Object.entries(files)) {
-    const filePath = path.join(authorPath, file)
+    const filePath = path.join(author, file)
     await io.mkdirP(path.dirname(filePath))
     await fs.promises.writeFile(filePath, text)
   }
-  git(authorPath, 'add', '--all')
-  git(authorPath, 'commit', '-q', '-m', 'commit')
-  git(authorPath, 'push', '-q', 'origin', 'main')
-  return git(authorPath, 'rev-parse', 'HEAD')
+  git(author, 'add', '--all')
+  for (const [file, commitSha] of Object.entries(gitlinks)) {
+    git(
+      author,
+      'update-index',
+      '--add',
+      '--cacheinfo',
+      `160000,${commitSha},${file}`
+    )
+  }
+  git(author, 'commit', '-q', '-m', 'commit')
+  git(author, 'push', '-q', 'origin', 'main')
+  return git(author, 'rev-parse', 'HEAD')
 }
 
 function fileText(commitSha: string, file: string): string {
@@ -262,6 +370,10 @@ function settingsFor(
   } as IGitSourceSettings
 }
 
+function withSubmodules(settings: IGitSourceSettings): IGitSourceSettings {
+  return {...settings, submodules: true}
+}
+
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, {
     cwd,
@@ -290,18 +402,27 @@ function flipIndexEntryObjectName(repository: string, blob: string): string {
 }
 
 /**
- * Flips one bit in the last byte of the packed object `objectName`, the
- * adler32 check that closes its zlib stream.
+ * Flips one bit in the last byte of the object `objectName` the git directory
+ * `gitDir` stores, loose or packed: the adler32 check that closes its zlib
+ * stream.
  */
-function corruptPackedObject(repository: string, objectName: string): void {
-  const packDir = path.join(repository, '.git', 'objects', 'pack')
+function corruptObject(gitDir: string, objectName: string): void {
+  const loose = path.join(
+    gitDir,
+    'objects',
+    objectName.substring(0, 2),
+    objectName.substring(2)
+  )
+  if (fs.existsSync(loose)) {
+    fs.chmodSync(loose, 0o644)
+    const bytes = fs.readFileSync(loose)
+    bytes[bytes.length - 1] ^= 0x01
+    fs.writeFileSync(loose, bytes)
+    return
+  }
+  const packDir = path.join(gitDir, 'objects', 'pack')
   for (const idx of fs.readdirSync(packDir).filter(f => f.endsWith('.idx'))) {
-    const listing = git(
-      repository,
-      'verify-pack',
-      '-v',
-      path.join(packDir, idx)
-    )
+    const listing = git(gitDir, 'verify-pack', '-v', path.join(packDir, idx))
     for (const line of listing.split('\n')) {
       const fields = line.trim().split(/\s+/)
       if (fields[0] !== objectName) {
@@ -318,16 +439,25 @@ function corruptPackedObject(repository: string, objectName: string): void {
       return
     }
   }
-  throw new Error(`No pack of '${repository}' holds ${objectName}`)
+  throw new Error(`'${gitDir}' stores no object ${objectName}`)
 }
 
 /**
  * Serves the repositories under `root` over git's smart HTTP protocol through
- * `git http-backend`, on a free port of 127.0.0.1.
+ * `git http-backend`, on a free port of 127.0.0.1. A request carrying more
+ * than one Authorization header is answered 400, as GitHub answers it.
  */
 async function startGitHttpServer(root: string): Promise<http.Server> {
   await io.mkdirP(root)
   const httpServer = http.createServer((request, response) => {
+    const authorizations = request.rawHeaders.filter(
+      (header, i) => i % 2 === 0 && header.toLowerCase() === 'authorization'
+    )
+    if (authorizations.length > 1) {
+      response.statusCode = 400
+      response.end()
+      return
+    }
     const chunks: Buffer[] = []
     request.on('data', chunk => chunks.push(chunk))
     request.on('end', () => {
