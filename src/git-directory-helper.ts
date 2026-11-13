@@ -30,20 +30,7 @@ export async function prepareExistingDirectory(
   ) {
     remove = true
   } else {
-    // Delete any index.lock and shallow.lock left by a previously canceled run or crashed git process
-    const lockPaths = [
-      path.join(repositoryPath, '.git', 'index.lock'),
-      path.join(repositoryPath, '.git', 'shallow.lock')
-    ]
-    for (const lockPath of lockPaths) {
-      try {
-        await io.rmRF(lockPath)
-      } catch (error) {
-        core.debug(
-          `Unable to delete '${lockPath}'. ${(error as any)?.message ?? error}`
-        )
-      }
-    }
+    await removeAbandonedLockFiles(repositoryPath)
 
     try {
       core.startGroup('Removing previously created refs, to avoid conflicts')
@@ -121,5 +108,179 @@ export async function prepareExistingDirectory(
     for (const file of await fs.promises.readdir(repositoryPath)) {
       await io.rmRF(path.join(repositoryPath, file))
     }
+  }
+}
+
+/**
+ * Deletes every git lock file in the repository at `repositoryPath`, and in
+ * the repositories of its submodules under `.git/modules`, that no live
+ * process holds.
+ *
+ * Git takes a lock by creating `<file>.lock` and removes it when the command
+ * ends. A git process killed mid-command, as a canceled job's orphaned git is,
+ * leaves the lock behind, and every later git command that takes the same
+ * lock fails with "File exists". On a runner that keeps its work directory
+ * between jobs, that one lock fails every job the runner takes afterwards.
+ *
+ * A lock is held while a live process has the lock file open or a live git
+ * process runs in the repository. A held lock stays and the checkout fails,
+ * naming the process: every git command the checkout runs would fail on the
+ * lock, and recreating the repository, the checkout's answer to a failed
+ * clean, would delete it from under that process. The processes are read
+ * from /proc; on a host without one, the runner giving one job at a time the
+ * work directory decides that a lock present as the job starts is abandoned.
+ */
+export async function removeAbandonedLockFiles(
+  repositoryPath: string
+): Promise<void> {
+  const lockPaths = await findLockFiles(path.join(repositoryPath, '.git'))
+  if (lockPaths.length === 0) {
+    return
+  }
+  const holders = findLockHolders(lockPaths, repositoryPath)
+  for (const lockPath of lockPaths) {
+    if (holders.has(lockPath)) {
+      continue
+    }
+    try {
+      await io.rmRF(lockPath)
+      core.info(`Removed the abandoned git lock '${lockPath}'`)
+    } catch (error) {
+      core.debug(
+        `Unable to delete '${lockPath}'. ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
+  }
+  if (holders.size > 0) {
+    const held = [...holders]
+      .map(([lockPath, holder]) => `'${lockPath}' is held by ${holder}`)
+      .join('; ')
+    throw new Error(
+      `A live process holds a git lock of the repository '${repositoryPath}': ${held}. The checkout leaves the repository to it.`
+    )
+  }
+}
+
+/**
+ * The `*.lock` files under a git directory, skipping the object stores,
+ * which hold no lock files and can be very large.
+ */
+export async function findLockFiles(gitDir: string): Promise<string[]> {
+  const found: string[] = []
+  const pending: string[] = [gitDir]
+  while (pending.length > 0) {
+    const dir = pending.pop() as string
+    let entries: fs.Dirent[]
+    try {
+      entries = await fs.promises.readdir(dir, {withFileTypes: true})
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      const entryPath = path.join(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (entry.name !== 'objects' && entry.name !== 'lfs') {
+          pending.push(entryPath)
+        }
+      } else if (entry.name.endsWith('.lock')) {
+        found.push(entryPath)
+      }
+    }
+  }
+  return found.sort()
+}
+
+/**
+ * Which of `lockPaths` a live process holds, mapped to a description of that
+ * process: a git process whose working directory is inside `repositoryPath`,
+ * which holds every lock of the repository for as long as it runs, or else a
+ * process with the lock file open. Empty on a host without /proc.
+ *
+ * /proc is read synchronously: a scan of every process's descriptors is tens
+ * of thousands of reads on a busy host, and each one awaited separately costs
+ * a round trip through the thread pool.
+ */
+function findLockHolders(
+  lockPaths: string[],
+  repositoryPath: string
+): Map<string, string> {
+  const holders = new Map<string, string>()
+  let pids: string[]
+  try {
+    pids = fs
+      .readdirSync('/proc')
+      .filter(name => /^[0-9]+$/.test(name) && name !== `${process.pid}`)
+  } catch {
+    return holders
+  }
+  // The kernel names an open file and a working directory by its real path.
+  const repository = realPathOf(repositoryPath)
+  for (const pid of pids) {
+    const procDir = path.join('/proc', pid)
+    const name = readProcName(procDir)
+    if (name !== 'git' && !name.startsWith('git-')) {
+      continue
+    }
+    const cwd = readLink(path.join(procDir, 'cwd'))
+    if (
+      cwd !== undefined &&
+      (cwd === repository || cwd.startsWith(`${repository}${path.sep}`))
+    ) {
+      for (const lockPath of lockPaths) {
+        holders.set(
+          lockPath,
+          `process ${pid} (${name}), running in the repository`
+        )
+      }
+      return holders
+    }
+  }
+  const wanted = new Map<string, string>()
+  for (const lockPath of lockPaths) {
+    wanted.set(realPathOf(lockPath), lockPath)
+  }
+  for (const pid of pids) {
+    const procDir = path.join('/proc', pid)
+    let fds: string[]
+    try {
+      fds = fs.readdirSync(path.join(procDir, 'fd'))
+    } catch {
+      // The process ended or belongs to another user.
+      continue
+    }
+    for (const fd of fds) {
+      const target = readLink(path.join(procDir, 'fd', fd))
+      const lockPath = target === undefined ? undefined : wanted.get(target)
+      if (lockPath) {
+        holders.set(lockPath, `process ${pid} (${readProcName(procDir)})`)
+      }
+    }
+  }
+  return holders
+}
+
+/** A process's command name, or `unknown` once it has ended. */
+function readProcName(procDir: string): string {
+  try {
+    return fs.readFileSync(path.join(procDir, 'comm'), 'utf8').trim()
+  } catch {
+    return 'unknown'
+  }
+}
+
+/** The target of a /proc link, or undefined once it is gone or unreadable. */
+function readLink(linkPath: string): string | undefined {
+  try {
+    return fs.readlinkSync(linkPath)
+  } catch {
+    return undefined
+  }
+}
+
+function realPathOf(filePath: string): string {
+  try {
+    return fs.realpathSync(filePath)
+  } catch {
+    return path.resolve(filePath)
   }
 }

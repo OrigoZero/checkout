@@ -1168,6 +1168,8 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.prepareExistingDirectory = prepareExistingDirectory;
+exports.removeAbandonedLockFiles = removeAbandonedLockFiles;
+exports.findLockFiles = findLockFiles;
 const assert = __importStar(__nccwpck_require__(9491));
 const core = __importStar(__nccwpck_require__(2186));
 const fs = __importStar(__nccwpck_require__(7147));
@@ -1176,7 +1178,6 @@ const io = __importStar(__nccwpck_require__(7436));
 const path = __importStar(__nccwpck_require__(1017));
 function prepareExistingDirectory(git, repositoryPath, repositoryUrl, clean, ref) {
     return __awaiter(this, void 0, void 0, function* () {
-        var _a;
         assert.ok(repositoryPath, 'Expected repositoryPath to be defined');
         assert.ok(repositoryUrl, 'Expected repositoryUrl to be defined');
         // Indicates whether to delete the directory contents
@@ -1191,19 +1192,7 @@ function prepareExistingDirectory(git, repositoryPath, repositoryUrl, clean, ref
             remove = true;
         }
         else {
-            // Delete any index.lock and shallow.lock left by a previously canceled run or crashed git process
-            const lockPaths = [
-                path.join(repositoryPath, '.git', 'index.lock'),
-                path.join(repositoryPath, '.git', 'shallow.lock')
-            ];
-            for (const lockPath of lockPaths) {
-                try {
-                    yield io.rmRF(lockPath);
-                }
-                catch (error) {
-                    core.debug(`Unable to delete '${lockPath}'. ${(_a = error === null || error === void 0 ? void 0 : error.message) !== null && _a !== void 0 ? _a : error}`);
-                }
-            }
+            yield removeAbandonedLockFiles(repositoryPath);
             try {
                 core.startGroup('Removing previously created refs, to avoid conflicts');
                 // Checkout detached HEAD
@@ -1270,6 +1259,172 @@ function prepareExistingDirectory(git, repositoryPath, repositoryUrl, clean, ref
             }
         }
     });
+}
+/**
+ * Deletes every git lock file in the repository at `repositoryPath`, and in
+ * the repositories of its submodules under `.git/modules`, that no live
+ * process holds.
+ *
+ * Git takes a lock by creating `<file>.lock` and removes it when the command
+ * ends. A git process killed mid-command, as a canceled job's orphaned git is,
+ * leaves the lock behind, and every later git command that takes the same
+ * lock fails with "File exists". On a runner that keeps its work directory
+ * between jobs, that one lock fails every job the runner takes afterwards.
+ *
+ * A lock is held while a live process has the lock file open or a live git
+ * process runs in the repository. A held lock stays and the checkout fails,
+ * naming the process: every git command the checkout runs would fail on the
+ * lock, and recreating the repository, the checkout's answer to a failed
+ * clean, would delete it from under that process. The processes are read
+ * from /proc; on a host without one, the runner giving one job at a time the
+ * work directory decides that a lock present as the job starts is abandoned.
+ */
+function removeAbandonedLockFiles(repositoryPath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const lockPaths = yield findLockFiles(path.join(repositoryPath, '.git'));
+        if (lockPaths.length === 0) {
+            return;
+        }
+        const holders = findLockHolders(lockPaths, repositoryPath);
+        for (const lockPath of lockPaths) {
+            if (holders.has(lockPath)) {
+                continue;
+            }
+            try {
+                yield io.rmRF(lockPath);
+                core.info(`Removed the abandoned git lock '${lockPath}'`);
+            }
+            catch (error) {
+                core.debug(`Unable to delete '${lockPath}'. ${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+        if (holders.size > 0) {
+            const held = [...holders]
+                .map(([lockPath, holder]) => `'${lockPath}' is held by ${holder}`)
+                .join('; ');
+            throw new Error(`A live process holds a git lock of the repository '${repositoryPath}': ${held}. The checkout leaves the repository to it.`);
+        }
+    });
+}
+/**
+ * The `*.lock` files under a git directory, skipping the object stores,
+ * which hold no lock files and can be very large.
+ */
+function findLockFiles(gitDir) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const found = [];
+        const pending = [gitDir];
+        while (pending.length > 0) {
+            const dir = pending.pop();
+            let entries;
+            try {
+                entries = yield fs.promises.readdir(dir, { withFileTypes: true });
+            }
+            catch (_a) {
+                continue;
+            }
+            for (const entry of entries) {
+                const entryPath = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    if (entry.name !== 'objects' && entry.name !== 'lfs') {
+                        pending.push(entryPath);
+                    }
+                }
+                else if (entry.name.endsWith('.lock')) {
+                    found.push(entryPath);
+                }
+            }
+        }
+        return found.sort();
+    });
+}
+/**
+ * Which of `lockPaths` a live process holds, mapped to a description of that
+ * process: a git process whose working directory is inside `repositoryPath`,
+ * which holds every lock of the repository for as long as it runs, or else a
+ * process with the lock file open. Empty on a host without /proc.
+ *
+ * /proc is read synchronously: a scan of every process's descriptors is tens
+ * of thousands of reads on a busy host, and each one awaited separately costs
+ * a round trip through the thread pool.
+ */
+function findLockHolders(lockPaths, repositoryPath) {
+    const holders = new Map();
+    let pids;
+    try {
+        pids = fs
+            .readdirSync('/proc')
+            .filter(name => /^[0-9]+$/.test(name) && name !== `${process.pid}`);
+    }
+    catch (_a) {
+        return holders;
+    }
+    // The kernel names an open file and a working directory by its real path.
+    const repository = realPathOf(repositoryPath);
+    for (const pid of pids) {
+        const procDir = path.join('/proc', pid);
+        const name = readProcName(procDir);
+        if (name !== 'git' && !name.startsWith('git-')) {
+            continue;
+        }
+        const cwd = readLink(path.join(procDir, 'cwd'));
+        if (cwd !== undefined &&
+            (cwd === repository || cwd.startsWith(`${repository}${path.sep}`))) {
+            for (const lockPath of lockPaths) {
+                holders.set(lockPath, `process ${pid} (${name}), running in the repository`);
+            }
+            return holders;
+        }
+    }
+    const wanted = new Map();
+    for (const lockPath of lockPaths) {
+        wanted.set(realPathOf(lockPath), lockPath);
+    }
+    for (const pid of pids) {
+        const procDir = path.join('/proc', pid);
+        let fds;
+        try {
+            fds = fs.readdirSync(path.join(procDir, 'fd'));
+        }
+        catch (_b) {
+            // The process ended or belongs to another user.
+            continue;
+        }
+        for (const fd of fds) {
+            const target = readLink(path.join(procDir, 'fd', fd));
+            const lockPath = target === undefined ? undefined : wanted.get(target);
+            if (lockPath) {
+                holders.set(lockPath, `process ${pid} (${readProcName(procDir)})`);
+            }
+        }
+    }
+    return holders;
+}
+/** A process's command name, or `unknown` once it has ended. */
+function readProcName(procDir) {
+    try {
+        return fs.readFileSync(path.join(procDir, 'comm'), 'utf8').trim();
+    }
+    catch (_a) {
+        return 'unknown';
+    }
+}
+/** The target of a /proc link, or undefined once it is gone or unreadable. */
+function readLink(linkPath) {
+    try {
+        return fs.readlinkSync(linkPath);
+    }
+    catch (_a) {
+        return undefined;
+    }
+}
+function realPathOf(filePath) {
+    try {
+        return fs.realpathSync(filePath);
+    }
+    catch (_a) {
+        return path.resolve(filePath);
+    }
 }
 
 

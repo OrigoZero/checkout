@@ -3,6 +3,7 @@ import * as fs from 'fs'
 import * as gitDirectoryHelper from '../lib/git-directory-helper'
 import * as io from '@actions/io'
 import * as path from 'path'
+import {execFileSync, spawn} from 'child_process'
 import {IGitCommandManager} from '../lib/git-command-manager'
 
 const testWorkspace = path.join(__dirname, '_temp', 'git-directory-helper')
@@ -374,6 +375,161 @@ describe('git-directory-helper tests', () => {
     expect(core.warning).not.toHaveBeenCalled()
     expect(git.tryClean).not.toHaveBeenCalled()
     expect(git.tryReset).not.toHaveBeenCalled()
+  })
+
+  const removesEveryAbandonedLockFile = 'removes every abandoned lock file'
+  it(removesEveryAbandonedLockFile, async () => {
+    // Arrange: the locks a canceled `git sparse-checkout set`, `git config`,
+    // `git update-ref` and a submodule fetch leave behind
+    await setup(removesEveryAbandonedLockFile)
+    clean = false
+    const gitDir = path.join(repositoryPath, '.git')
+    const abandoned = [
+      path.join(gitDir, 'info', 'sparse-checkout.lock'),
+      path.join(gitDir, 'config.lock'),
+      path.join(gitDir, 'HEAD.lock'),
+      path.join(gitDir, 'packed-refs.lock'),
+      path.join(gitDir, 'refs', 'remotes', 'origin', 'main.lock'),
+      path.join(gitDir, 'modules', 'third_party', 'dlss', 'shallow.lock'),
+      path.join(gitDir, 'modules', 'third_party', 'dlss', 'index.lock')
+    ]
+    for (const lockPath of abandoned) {
+      await fs.promises.mkdir(path.dirname(lockPath), {recursive: true})
+      await fs.promises.writeFile(lockPath, '')
+    }
+    const kept = [
+      path.join(gitDir, 'info', 'sparse-checkout'),
+      path.join(gitDir, 'objects', 'pack', 'pack-1.keep')
+    ]
+    for (const keptPath of kept) {
+      await fs.promises.mkdir(path.dirname(keptPath), {recursive: true})
+      await fs.promises.writeFile(keptPath, '')
+    }
+
+    // Act
+    await gitDirectoryHelper.prepareExistingDirectory(
+      git,
+      repositoryPath,
+      repositoryUrl,
+      clean,
+      ref
+    )
+
+    // Assert
+    for (const lockPath of abandoned) {
+      expect(fs.existsSync(lockPath)).toBe(false)
+    }
+    for (const keptPath of kept) {
+      expect(fs.existsSync(keptPath)).toBe(true)
+    }
+    expect(core.warning).not.toHaveBeenCalled()
+  })
+
+  // A lock's holder is read from /proc, which only a Linux host has.
+  const itWithProc = fs.existsSync('/proc/self/fd') ? it : it.skip
+
+  const keepsALockFileALiveProcessHolds =
+    'keeps a lock file a live process holds'
+  itWithProc(keepsALockFileALiveProcessHolds, async () => {
+    // Arrange: a live process with the lock open, as a running git holds it
+    await setup(keepsALockFileALiveProcessHolds)
+    const held = path.join(
+      repositoryPath,
+      '.git',
+      'info',
+      'sparse-checkout.lock'
+    )
+    const abandoned = path.join(repositoryPath, '.git', 'config.lock')
+    await fs.promises.mkdir(path.dirname(held), {recursive: true})
+    await fs.promises.writeFile(held, '')
+    await fs.promises.writeFile(abandoned, '')
+    await fs.promises.writeFile(path.join(repositoryPath, 'my-file'), '')
+    const holder = spawn(
+      'sh',
+      ['-c', 'exec 3<"$0"; echo ready; exec sleep 30', held],
+      {
+        stdio: ['ignore', 'pipe', 'ignore']
+      }
+    )
+    await new Promise<void>(resolve =>
+      holder.stdout.once('data', () => resolve())
+    )
+
+    try {
+      // Act
+      const prepared = gitDirectoryHelper.prepareExistingDirectory(
+        git,
+        repositoryPath,
+        repositoryUrl,
+        clean,
+        ref
+      )
+
+      // Assert: the checkout stops, naming the lock and its holder, and
+      // leaves the repository as it is
+      await expect(prepared).rejects.toThrow(
+        `'${held}' is held by process ${holder.pid} (sleep)`
+      )
+      expect(fs.existsSync(held)).toBe(true)
+      expect(fs.existsSync(abandoned)).toBe(false)
+      expect(fs.existsSync(path.join(repositoryPath, 'my-file'))).toBe(true)
+      expect(git.isDetached).not.toHaveBeenCalled()
+      expect(git.tryClean).not.toHaveBeenCalled()
+    } finally {
+      holder.kill('SIGKILL')
+    }
+  })
+
+  const keepsEveryLockWhileGitRunsInTheRepository =
+    'keeps every lock while git runs in the repository'
+  itWithProc(keepsEveryLockWhileGitRunsInTheRepository, async () => {
+    // Arrange: a live git process whose working directory is the repository
+    await setup(keepsEveryLockWhileGitRunsInTheRepository)
+    execFileSync('git', ['init', '--quiet', repositoryPath])
+    const locks = [
+      path.join(repositoryPath, '.git', 'info', 'sparse-checkout.lock'),
+      path.join(repositoryPath, '.git', 'config.lock')
+    ]
+    await fs.promises.mkdir(path.join(repositoryPath, '.git', 'info'), {
+      recursive: true
+    })
+    for (const lockPath of locks) {
+      await fs.promises.writeFile(lockPath, '')
+    }
+    const running = spawn('git', ['hash-object', '--stdin'], {
+      cwd: repositoryPath,
+      stdio: ['pipe', 'ignore', 'ignore']
+    })
+    const comm = path.join('/proc', `${running.pid}`, 'comm')
+    while (
+      !fs.existsSync(comm) ||
+      fs.readFileSync(comm, 'utf8').trim() !== 'git'
+    ) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+
+    try {
+      // Act
+      const prepared = gitDirectoryHelper.prepareExistingDirectory(
+        git,
+        repositoryPath,
+        repositoryUrl,
+        clean,
+        ref
+      )
+
+      // Assert: every lock stays and the checkout stops, naming the process
+      await expect(prepared).rejects.toThrow(
+        `process ${running.pid} (git), running in the repository`
+      )
+      for (const lockPath of locks) {
+        expect(fs.existsSync(lockPath)).toBe(true)
+      }
+      expect(git.isDetached).not.toHaveBeenCalled()
+      expect(git.tryClean).not.toHaveBeenCalled()
+    } finally {
+      running.kill('SIGKILL')
+    }
   })
 
   const removesAncestorRemoteBranch = 'removes ancestor remote branch'
