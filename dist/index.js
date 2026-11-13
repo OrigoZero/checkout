@@ -1168,6 +1168,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.prepareExistingDirectory = prepareExistingDirectory;
+exports.removeDirectoryContents = removeDirectoryContents;
 exports.removeAbandonedLockFiles = removeAbandonedLockFiles;
 exports.findLockFiles = findLockFiles;
 const assert = __importStar(__nccwpck_require__(9491));
@@ -1251,12 +1252,19 @@ function prepareExistingDirectory(git, repositoryPath, repositoryUrl, clean, ref
             }
         }
         if (remove) {
-            // Delete the contents of the directory. Don't delete the directory itself
-            // since it might be the current working directory.
-            core.info(`Deleting the contents of '${repositoryPath}'`);
-            for (const file of yield fs.promises.readdir(repositoryPath)) {
-                yield io.rmRF(path.join(repositoryPath, file));
-            }
+            yield removeDirectoryContents(repositoryPath);
+        }
+    });
+}
+/**
+ * Deletes the contents of the directory at `repositoryPath`. The directory
+ * itself stays, since it might be the current working directory.
+ */
+function removeDirectoryContents(repositoryPath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        core.info(`Deleting the contents of '${repositoryPath}'`);
+        for (const file of yield fs.promises.readdir(repositoryPath)) {
+            yield io.rmRF(path.join(repositoryPath, file));
         }
     });
 }
@@ -1537,104 +1545,27 @@ function getSource(settings) {
             }
             // Save state for POST action
             stateHelper.setRepositoryPath(settings.repositoryPath);
-            // Initialize the repository
-            if (!fsHelper.directoryExistsSync(path.join(settings.repositoryPath, '.git'))) {
-                core.startGroup('Initializing the repository');
-                yield git.init();
-                yield git.remoteAdd('origin', repositoryUrl);
-                core.endGroup();
-            }
-            // Disable automatic garbage collection
-            core.startGroup('Disabling automatic garbage collection');
-            if (!(yield git.tryDisableAutomaticGarbageCollection())) {
-                core.warning(`Unable to turn off git automatic garbage collection. The git fetch operation may trigger garbage collection and cause a delay.`);
-            }
-            core.endGroup();
+            // A repository the runner kept from an earlier job
+            const kept = isExisting &&
+                fsHelper.directoryExistsSync(path.join(settings.repositoryPath, '.git'));
             // If we didn't initialize it above, do it now
             if (!authHelper) {
                 authHelper = gitAuthHelper.createAuthHelper(git, settings);
             }
-            // Configure auth
-            core.startGroup('Setting up auth');
-            yield authHelper.configureAuth();
-            core.endGroup();
-            // Determine the default branch
-            if (!settings.ref && !settings.commit) {
-                core.startGroup('Determining the default branch');
-                if (settings.sshKey) {
-                    settings.ref = yield git.getDefaultBranch(repositoryUrl);
+            try {
+                yield fetchAndCheckout(git, settings, repositoryUrl, authHelper);
+            }
+            catch (error) {
+                if (!kept) {
+                    throw error;
                 }
-                else {
-                    settings.ref = yield githubApiHelper.getDefaultBranch(settings.authToken, settings.repositoryOwner, settings.repositoryName, settings.githubServerUrl);
-                }
-                core.endGroup();
+                // The kept repository is a cache of the remote: its object store or its
+                // index can hold an object that is corrupt, or name one the store lacks
+                // and the remote does not serve. A fresh repository holds neither.
+                core.warning(`The checkout failed in the repository kept from an earlier job: ${error instanceof Error ? error.message : String(error)}. The repository will be recreated and the checkout run once more.`);
+                yield gitDirectoryHelper.removeDirectoryContents(settings.repositoryPath);
+                yield fetchAndCheckout(git, settings, repositoryUrl, authHelper);
             }
-            // LFS install
-            if (settings.lfs) {
-                yield git.lfsInstall();
-            }
-            // Fetch
-            core.startGroup('Fetching the repository');
-            const fetchOptions = {};
-            if (settings.filter) {
-                fetchOptions.filter = settings.filter;
-            }
-            else if (settings.sparseCheckout) {
-                fetchOptions.filter = 'blob:none';
-            }
-            if (settings.fetchDepth <= 0) {
-                // Fetch all branches and tags
-                let refSpec = refHelper.getRefSpecForAllHistory(settings.ref, settings.commit);
-                yield git.fetch(refSpec, fetchOptions);
-                // When all history is fetched, the ref we're interested in may have moved to a different
-                // commit (push or force push). If so, fetch again with a targeted refspec.
-                if (!(yield refHelper.testRef(git, settings.ref, settings.commit))) {
-                    refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
-                    yield git.fetch(refSpec, fetchOptions);
-                }
-            }
-            else {
-                fetchOptions.fetchDepth = settings.fetchDepth;
-                fetchOptions.fetchTags = settings.fetchTags;
-                const refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
-                yield git.fetch(refSpec, fetchOptions);
-            }
-            core.endGroup();
-            // Checkout info
-            core.startGroup('Determining the checkout info');
-            const checkoutInfo = yield refHelper.getCheckoutInfo(git, settings.ref, settings.commit);
-            core.endGroup();
-            // LFS fetch
-            // Explicit lfs-fetch to avoid slow checkout (fetches one lfs object at a time).
-            // Explicit lfs fetch will fetch lfs objects in parallel.
-            // For sparse checkouts, let `checkout` fetch the needed objects lazily.
-            if (settings.lfs && !settings.sparseCheckout) {
-                core.startGroup('Fetching LFS objects');
-                yield git.lfsFetch(checkoutInfo.startPoint || checkoutInfo.ref);
-                core.endGroup();
-            }
-            // Sparse checkout
-            if (!settings.sparseCheckout) {
-                let gitVersion = yield git.version();
-                // no need to disable sparse-checkout if the installed git runtime doesn't even support it.
-                if (gitVersion.checkMinimum(git_command_manager_1.MinimumGitSparseCheckoutVersion)) {
-                    yield git.disableSparseCheckout();
-                }
-            }
-            else {
-                core.startGroup('Setting up sparse checkout');
-                if (settings.sparseCheckoutConeMode) {
-                    yield git.sparseCheckout(settings.sparseCheckout);
-                }
-                else {
-                    yield git.sparseCheckoutNonConeMode(settings.sparseCheckout);
-                }
-                core.endGroup();
-            }
-            // Checkout
-            core.startGroup('Checking out the ref');
-            yield git.checkout(checkoutInfo.ref, checkoutInfo.startPoint);
-            core.endGroup();
             // Submodules
             if (settings.submodules) {
                 // Temporarily override global config
@@ -1708,6 +1639,108 @@ function cleanup(repositoryPath) {
         finally {
             yield authHelper.removeGlobalConfig();
         }
+    });
+}
+/**
+ * Initializes the repository at `settings.repositoryPath` when it holds none,
+ * fetches the ref and checks it out.
+ */
+function fetchAndCheckout(git, settings, repositoryUrl, authHelper) {
+    return __awaiter(this, void 0, void 0, function* () {
+        // Initialize the repository
+        if (!fsHelper.directoryExistsSync(path.join(settings.repositoryPath, '.git'))) {
+            core.startGroup('Initializing the repository');
+            yield git.init();
+            yield git.remoteAdd('origin', repositoryUrl);
+            core.endGroup();
+        }
+        // Disable automatic garbage collection
+        core.startGroup('Disabling automatic garbage collection');
+        if (!(yield git.tryDisableAutomaticGarbageCollection())) {
+            core.warning(`Unable to turn off git automatic garbage collection. The git fetch operation may trigger garbage collection and cause a delay.`);
+        }
+        core.endGroup();
+        // Configure auth
+        core.startGroup('Setting up auth');
+        yield authHelper.configureAuth();
+        core.endGroup();
+        // Determine the default branch
+        if (!settings.ref && !settings.commit) {
+            core.startGroup('Determining the default branch');
+            if (settings.sshKey) {
+                settings.ref = yield git.getDefaultBranch(repositoryUrl);
+            }
+            else {
+                settings.ref = yield githubApiHelper.getDefaultBranch(settings.authToken, settings.repositoryOwner, settings.repositoryName, settings.githubServerUrl);
+            }
+            core.endGroup();
+        }
+        // LFS install
+        if (settings.lfs) {
+            yield git.lfsInstall();
+        }
+        // Fetch
+        core.startGroup('Fetching the repository');
+        const fetchOptions = {};
+        if (settings.filter) {
+            fetchOptions.filter = settings.filter;
+        }
+        else if (settings.sparseCheckout) {
+            fetchOptions.filter = 'blob:none';
+        }
+        if (settings.fetchDepth <= 0) {
+            // Fetch all branches and tags
+            let refSpec = refHelper.getRefSpecForAllHistory(settings.ref, settings.commit);
+            yield git.fetch(refSpec, fetchOptions);
+            // When all history is fetched, the ref we're interested in may have moved to a different
+            // commit (push or force push). If so, fetch again with a targeted refspec.
+            if (!(yield refHelper.testRef(git, settings.ref, settings.commit))) {
+                refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
+                yield git.fetch(refSpec, fetchOptions);
+            }
+        }
+        else {
+            fetchOptions.fetchDepth = settings.fetchDepth;
+            fetchOptions.fetchTags = settings.fetchTags;
+            const refSpec = refHelper.getRefSpec(settings.ref, settings.commit);
+            yield git.fetch(refSpec, fetchOptions);
+        }
+        core.endGroup();
+        // Checkout info
+        core.startGroup('Determining the checkout info');
+        const checkoutInfo = yield refHelper.getCheckoutInfo(git, settings.ref, settings.commit);
+        core.endGroup();
+        // LFS fetch
+        // Explicit lfs-fetch to avoid slow checkout (fetches one lfs object at a time).
+        // Explicit lfs fetch will fetch lfs objects in parallel.
+        // For sparse checkouts, let `checkout` fetch the needed objects lazily.
+        if (settings.lfs && !settings.sparseCheckout) {
+            core.startGroup('Fetching LFS objects');
+            yield git.lfsFetch(checkoutInfo.startPoint || checkoutInfo.ref);
+            core.endGroup();
+        }
+        // Sparse checkout
+        if (!settings.sparseCheckout) {
+            let gitVersion = yield git.version();
+            // no need to disable sparse-checkout if the installed git runtime doesn't even support it.
+            if (gitVersion.checkMinimum(git_command_manager_1.MinimumGitSparseCheckoutVersion)) {
+                yield git.disableSparseCheckout();
+            }
+        }
+        else {
+            core.startGroup('Setting up sparse checkout');
+            if (settings.sparseCheckoutConeMode) {
+                yield git.sparseCheckout(settings.sparseCheckout);
+            }
+            else {
+                yield git.sparseCheckoutNonConeMode(settings.sparseCheckout);
+            }
+            core.endGroup();
+        }
+        // Checkout
+        core.startGroup('Checking out the ref');
+        yield git.checkout(checkoutInfo.ref, checkoutInfo.startPoint);
+        core.endGroup();
     });
 }
 function getGitCommandManager(settings) {
