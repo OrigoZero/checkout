@@ -21,6 +21,7 @@ export interface IGitAuthHelper {
   configureSubmoduleAuth(): Promise<void>
   configureTempGlobalConfig(): Promise<string>
   removeAuth(): Promise<void>
+  removeGlobalAuth(): Promise<void>
   removeGlobalConfig(): Promise<void>
 }
 
@@ -191,6 +192,19 @@ class GitAuthHelper {
   async removeAuth(): Promise<void> {
     await this.removeSsh()
     await this.removeToken()
+  }
+
+  /**
+   * Removes the token and the HTTPS instead of SSH values `configureGlobalAuth`
+   * wrote to the temporary global config, keeping the config itself and the
+   * HOME override that names it.
+   */
+  async removeGlobalAuth(): Promise<void> {
+    if (!(this.temporaryHomePath?.length > 0)) {
+      return
+    }
+    await this.git.tryConfigUnset(this.tokenConfigKey, true)
+    await this.git.tryConfigUnset(this.insteadOfKey, true)
   }
 
   async removeGlobalConfig(): Promise<void> {

@@ -285,6 +285,21 @@ class GitAuthHelper {
             yield this.removeToken();
         });
     }
+    /**
+     * Removes the token and the HTTPS instead of SSH values `configureGlobalAuth`
+     * wrote to the temporary global config, keeping the config itself and the
+     * HOME override that names it.
+     */
+    removeGlobalAuth() {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a;
+            if (!(((_a = this.temporaryHomePath) === null || _a === void 0 ? void 0 : _a.length) > 0)) {
+                return;
+            }
+            yield this.git.tryConfigUnset(this.tokenConfigKey, true);
+            yield this.git.tryConfigUnset(this.insteadOfKey, true);
+        });
+    }
     removeGlobalConfig() {
         return __awaiter(this, void 0, void 0, function* () {
             var _a;
@@ -1560,30 +1575,15 @@ function getSource(settings) {
                     throw error;
                 }
                 // The kept repository is a cache of the remote: its object store or its
-                // index can hold an object that is corrupt, or name one the store lacks
-                // and the remote does not serve. A fresh repository holds neither.
+                // index, or a submodule's, can hold an object that is corrupt, or name
+                // one the store lacks and the remote does not serve. A fresh repository
+                // holds neither.
                 core.warning(`The checkout failed in the repository kept from an earlier job: ${error instanceof Error ? error.message : String(error)}. The repository will be recreated and the checkout run once more.`);
+                // The submodule fetch's auth lives in the temporary global config; the
+                // fetch of the recreated repository carries the token from its own.
+                yield authHelper.removeGlobalAuth();
                 yield gitDirectoryHelper.removeDirectoryContents(settings.repositoryPath);
                 yield fetchAndCheckout(git, settings, repositoryUrl, authHelper);
-            }
-            // Submodules
-            if (settings.submodules) {
-                // Temporarily override global config
-                core.startGroup('Setting up auth for fetching submodules');
-                yield authHelper.configureGlobalAuth();
-                core.endGroup();
-                // Checkout submodules
-                core.startGroup('Fetching submodules');
-                yield git.submoduleSync(settings.nestedSubmodules);
-                yield git.submoduleUpdate(settings.fetchDepth, settings.nestedSubmodules);
-                yield git.submoduleForeach('git config --local gc.auto 0', settings.nestedSubmodules);
-                core.endGroup();
-                // Persist credentials
-                if (settings.persistCredentials) {
-                    core.startGroup('Persisting credentials for submodules');
-                    yield authHelper.configureSubmoduleAuth();
-                    core.endGroup();
-                }
             }
             // Get commit information
             const commitInfo = yield git.log1();
@@ -1643,7 +1643,8 @@ function cleanup(repositoryPath) {
 }
 /**
  * Initializes the repository at `settings.repositoryPath` when it holds none,
- * fetches the ref and checks it out.
+ * fetches the ref and checks it out, with its submodules when the settings
+ * name them.
  */
 function fetchAndCheckout(git, settings, repositoryUrl, authHelper) {
     return __awaiter(this, void 0, void 0, function* () {
@@ -1741,6 +1742,25 @@ function fetchAndCheckout(git, settings, repositoryUrl, authHelper) {
         core.startGroup('Checking out the ref');
         yield git.checkout(checkoutInfo.ref, checkoutInfo.startPoint);
         core.endGroup();
+        // Submodules
+        if (settings.submodules) {
+            // Temporarily override global config
+            core.startGroup('Setting up auth for fetching submodules');
+            yield authHelper.configureGlobalAuth();
+            core.endGroup();
+            // Checkout submodules
+            core.startGroup('Fetching submodules');
+            yield git.submoduleSync(settings.nestedSubmodules);
+            yield git.submoduleUpdate(settings.fetchDepth, settings.nestedSubmodules);
+            yield git.submoduleForeach('git config --local gc.auto 0', settings.nestedSubmodules);
+            core.endGroup();
+            // Persist credentials
+            if (settings.persistCredentials) {
+                core.startGroup('Persisting credentials for submodules');
+                yield authHelper.configureSubmoduleAuth();
+                core.endGroup();
+            }
+        }
     });
 }
 function getGitCommandManager(settings) {

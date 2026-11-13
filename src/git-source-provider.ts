@@ -122,38 +122,17 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
         throw error
       }
       // The kept repository is a cache of the remote: its object store or its
-      // index can hold an object that is corrupt, or name one the store lacks
-      // and the remote does not serve. A fresh repository holds neither.
+      // index, or a submodule's, can hold an object that is corrupt, or name
+      // one the store lacks and the remote does not serve. A fresh repository
+      // holds neither.
       core.warning(
         `The checkout failed in the repository kept from an earlier job: ${error instanceof Error ? error.message : String(error)}. The repository will be recreated and the checkout run once more.`
       )
+      // The submodule fetch's auth lives in the temporary global config; the
+      // fetch of the recreated repository carries the token from its own.
+      await authHelper.removeGlobalAuth()
       await gitDirectoryHelper.removeDirectoryContents(settings.repositoryPath)
       await fetchAndCheckout(git, settings, repositoryUrl, authHelper)
-    }
-
-    // Submodules
-    if (settings.submodules) {
-      // Temporarily override global config
-      core.startGroup('Setting up auth for fetching submodules')
-      await authHelper.configureGlobalAuth()
-      core.endGroup()
-
-      // Checkout submodules
-      core.startGroup('Fetching submodules')
-      await git.submoduleSync(settings.nestedSubmodules)
-      await git.submoduleUpdate(settings.fetchDepth, settings.nestedSubmodules)
-      await git.submoduleForeach(
-        'git config --local gc.auto 0',
-        settings.nestedSubmodules
-      )
-      core.endGroup()
-
-      // Persist credentials
-      if (settings.persistCredentials) {
-        core.startGroup('Persisting credentials for submodules')
-        await authHelper.configureSubmoduleAuth()
-        core.endGroup()
-      }
     }
 
     // Get commit information
@@ -232,7 +211,8 @@ export async function cleanup(repositoryPath: string): Promise<void> {
 
 /**
  * Initializes the repository at `settings.repositoryPath` when it holds none,
- * fetches the ref and checks it out.
+ * fetches the ref and checks it out, with its submodules when the settings
+ * name them.
  */
 async function fetchAndCheckout(
   git: IGitCommandManager,
@@ -362,6 +342,31 @@ async function fetchAndCheckout(
   core.startGroup('Checking out the ref')
   await git.checkout(checkoutInfo.ref, checkoutInfo.startPoint)
   core.endGroup()
+
+  // Submodules
+  if (settings.submodules) {
+    // Temporarily override global config
+    core.startGroup('Setting up auth for fetching submodules')
+    await authHelper.configureGlobalAuth()
+    core.endGroup()
+
+    // Checkout submodules
+    core.startGroup('Fetching submodules')
+    await git.submoduleSync(settings.nestedSubmodules)
+    await git.submoduleUpdate(settings.fetchDepth, settings.nestedSubmodules)
+    await git.submoduleForeach(
+      'git config --local gc.auto 0',
+      settings.nestedSubmodules
+    )
+    core.endGroup()
+
+    // Persist credentials
+    if (settings.persistCredentials) {
+      core.startGroup('Persisting credentials for submodules')
+      await authHelper.configureSubmoduleAuth()
+      core.endGroup()
+    }
+  }
 }
 
 async function getGitCommandManager(
